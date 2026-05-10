@@ -1,0 +1,311 @@
+#!/usr/bin/env python3
+"""
+coop-observe: passive observation layer for agent-coop V1.
+
+Does NOT modify, block, or enforce anything. Only observes:
+  - what files were actually changed (via git)
+  - what claims existed when changes happened
+  - whether claims matched the changing agent
+  - whether changes were followed by meaningful events
+
+Run periodically (e.g. every 5 min, or via cron) to capture snapshots.
+At end of week, run `coop-observe report` for a plain summary.
+
+Truth model:
+  - observations.jsonl is append-only, this tool's own ground truth
+  - we read events.jsonl + claims.json + git, never write to .agent-coop/
+
+Design rule: this tool produces feldnotes, not dashboards.
+If it ever needs a chart, we've already drifted.
+"""
+import json
+import os
+import sys
+import argparse
+import subprocess
+from datetime import datetime, timezone
+from pathlib import Path
+
+ROOT = Path(os.environ.get("COOP_ROOT", ".")).resolve()
+COOP_DIR = ROOT / ".agent-coop"
+EVENTS = COOP_DIR / "events.jsonl"
+CLAIMS = COOP_DIR / "claims.json"
+OBSERVATIONS = COOP_DIR / "observations.jsonl"
+
+
+def now_iso():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def git(*args):
+    """Run git command, return stdout. Empty string on failure."""
+    try:
+        result = subprocess.run(
+            ["git", *args], cwd=ROOT, capture_output=True, text=True, check=False
+        )
+        return result.stdout.strip()
+    except FileNotFoundError:
+        return ""
+
+
+def load_events():
+    if not EVENTS.exists():
+        return []
+    with EVENTS.open() as f:
+        return [json.loads(line) for line in f if line.strip()]
+
+
+def load_claims_history():
+    """Reconstruct claim history from events. We can't trust claims.json
+    for history because it's mutable; events are the ground truth."""
+    events = load_events()
+    return [e for e in events if e["type"] in ("CLAIM", "RELEASE")]
+
+
+def append_observation(obs_type: str, data: dict):
+    obs = {"ts": now_iso(), "type": obs_type, "data": data}
+    with OBSERVATIONS.open("a") as f:
+        f.write(json.dumps(obs) + "\n")
+    return obs
+
+
+def cmd_snapshot(args):
+    """Take a snapshot: what's changed in git since last snapshot,
+    cross-referenced with claim state at change time.
+
+    Note: we cannot perfectly attribute git changes to specific agents
+    unless agents commit under different identities. We log what we can
+    see, and flag attribution gaps honestly.
+    """
+    # current git state
+    head = git("rev-parse", "HEAD") or "no-commits"
+    status = git("status", "--porcelain")
+    # files changed since last commit (working tree + index)
+    changed_files = []
+    for line in status.splitlines():
+        if not line.strip():
+            continue
+        # porcelain format: "XY filename" where X,Y are status codes
+        parts = line.strip().split(maxsplit=1)
+        if len(parts) == 2:
+            changed_files.append(parts[1])
+
+    # last commit info (who, when, what)
+    last_commit = {
+        "sha": git("log", "-1", "--format=%H"),
+        "author": git("log", "-1", "--format=%an"),
+        "message": git("log", "-1", "--format=%s"),
+        "ts": git("log", "-1", "--format=%cI"),
+        "files": git("diff-tree", "--no-commit-id", "--name-only", "-r", "HEAD").splitlines(),
+    }
+
+    # current claims (best effort, may have rolled over since change)
+    try:
+        with CLAIMS.open() as f:
+            current_claims = json.load(f).get("claims", [])
+    except (FileNotFoundError, json.JSONDecodeError):
+        current_claims = []
+
+    snapshot = {
+        "head": head,
+        "uncommitted_changes": changed_files,
+        "last_commit": last_commit,
+        "active_claims_now": current_claims,
+        "event_count": len(load_events()),
+    }
+    obs = append_observation("SNAPSHOT", snapshot)
+    print(f"Snapshot @ {obs['ts']}: {len(changed_files)} uncommitted, "
+          f"{len(current_claims)} active claims, {snapshot['event_count']} events")
+
+
+def parse_iso(s):
+    # tolerate both "Z" and "+00:00"
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    return datetime.fromisoformat(s)
+
+
+def cmd_report(args):
+    """Plain text report. Five questions, honest answers, no scoring.
+
+    The questions are derived from V1 README's empirical questions but
+    intentionally not turned into pass/fail metrics. We report numbers;
+    the human decides what they mean.
+    """
+    events = load_events()
+    claim_events = [e for e in events if e["type"] == "CLAIM"]
+    release_events = [e for e in events if e["type"] == "RELEASE"]
+    decision_events = [e for e in events if e["type"] == "DECISION"]
+    disagree_events = [e for e in events if e["type"] == "DISAGREE"]
+    done_events = [e for e in events if e["type"] == "DONE"]
+
+    # commits in observation window
+    commits_log = git("log", "--format=%H|%an|%cI|%s")
+    commits = []
+    for line in commits_log.splitlines():
+        parts = line.split("|", 3)
+        if len(parts) == 4:
+            commits.append({
+                "sha": parts[0], "author": parts[1],
+                "ts": parts[2], "message": parts[3],
+            })
+
+    # Q1: did agents claim before changing?
+    # heuristic: for each commit, were there active claims by the commit author
+    # for any of the changed files at commit time?
+    bypass_count = 0
+    matched_count = 0
+    attribution_gaps = 0
+    for c in commits:
+        files = git("diff-tree", "--no-commit-id", "--name-only", "-r", c["sha"]).splitlines()
+        if not files:
+            continue
+        commit_time = parse_iso(c["ts"])
+        # find claims active at commit_time
+        active_at_commit = []
+        for ce in claim_events:
+            ce_time = parse_iso(ce["ts"])
+            if ce_time > commit_time:
+                continue
+            expires = ce["payload"].get("expires")
+            if expires and parse_iso(expires) < commit_time:
+                continue
+            active_at_commit.append(ce)
+        # check if author had a claim covering any changed file
+        # NOTE: author name from git may not equal agent name in coop
+        # this is an attribution gap we flag honestly
+        author_claims = [ac for ac in active_at_commit
+                         if ac["agent"].lower() in c["author"].lower()
+                         or c["author"].lower() in ac["agent"].lower()]
+        if not author_claims and active_at_commit:
+            attribution_gaps += 1
+        for f in files:
+            if any(f.startswith(ac["payload"]["path"]) for ac in author_claims):
+                matched_count += 1
+            else:
+                bypass_count += 1
+
+    # Q2: claim expiry vs release
+    expired_without_release = 0
+    for ce in claim_events:
+        agent = ce["agent"]
+        path = ce["payload"]["path"]
+        ce_time = parse_iso(ce["ts"])
+        expires = parse_iso(ce["payload"]["expires"])
+        # was there a RELEASE before expiry?
+        released = any(
+            re["agent"] == agent
+            and re["payload"]["path"] == path
+            and parse_iso(re["ts"]) > ce_time
+            and parse_iso(re["ts"]) < expires
+            for re in release_events
+        )
+        if not released and expires < datetime.now(timezone.utc):
+            expired_without_release += 1
+
+    # Q3: event volume per agent
+    agent_event_counts = {}
+    for e in events:
+        agent_event_counts[e["agent"]] = agent_event_counts.get(e["agent"], 0) + 1
+
+    # report
+    lines = []
+    lines.append(f"=== coop-observe report @ {now_iso()} ===")
+    lines.append("")
+    lines.append("This is a passive observation report. Numbers, not verdicts.")
+    lines.append("")
+    lines.append(f"Total events: {len(events)}")
+    lines.append(f"  CLAIM:    {len(claim_events)}")
+    lines.append(f"  RELEASE:  {len(release_events)}")
+    lines.append(f"  DECISION: {len(decision_events)}")
+    lines.append(f"  DISAGREE: {len(disagree_events)}")
+    lines.append(f"  DONE:     {len(done_events)}")
+    lines.append("")
+    lines.append(f"Total commits observed: {len(commits)}")
+    lines.append(f"  file-changes with matching claim:    {matched_count}")
+    lines.append(f"  file-changes without matching claim: {bypass_count}")
+    if matched_count + bypass_count > 0:
+        ratio = matched_count / (matched_count + bypass_count)
+        lines.append(f"  rough compliance ratio: {ratio:.0%}")
+    lines.append(f"  commits with attribution gaps: {attribution_gaps}")
+    lines.append("    (author name didn't match any active agent claim;")
+    lines.append("     could mean ignored protocol OR git identity mismatch)")
+    lines.append("")
+    lines.append(f"Claims that expired without RELEASE: {expired_without_release}")
+    lines.append("    (potential CLAIM_STALE_RESUME signal — investigate manually)")
+    lines.append("")
+    lines.append("Events per agent:")
+    for agent, count in sorted(agent_event_counts.items()):
+        lines.append(f"  {agent:15s} {count}")
+    lines.append("")
+    lines.append("DISAGREE events (read these manually):")
+    if not disagree_events:
+        lines.append("  (none)")
+    else:
+        for d in disagree_events:
+            lines.append(f"  [{d['ts']}] {d['agent']}: {json.dumps(d['payload'])[:120]}")
+    lines.append("")
+    lines.append("DECISION events sampled (read full log for context):")
+    sample = decision_events[-5:] if len(decision_events) > 5 else decision_events
+    for d in sample:
+        topic = d['payload'].get('topic', '?')
+        choice = d['payload'].get('choice', '?')
+        lines.append(f"  [{d['ts']}] {d['agent']}: {topic} → {choice}")
+    lines.append("")
+    lines.append("Reminder: this report does not say whether the system 'works'.")
+    lines.append("It tells you what happened. The verdict is yours, with feldnotes.")
+
+    print("\n".join(lines))
+
+
+def cmd_attribution_check(args):
+    """Help diagnose the git-author vs coop-agent name mismatch.
+    Lists git authors seen and agents seen, side by side.
+    """
+    git_authors = set()
+    for line in git("log", "--format=%an").splitlines():
+        if line.strip():
+            git_authors.add(line.strip())
+
+    events = load_events()
+    coop_agents = set(e["agent"] for e in events)
+
+    print("Git authors seen in repo:")
+    for a in sorted(git_authors):
+        print(f"  {a}")
+    print()
+    print("Coop agents seen in events.jsonl:")
+    for a in sorted(coop_agents):
+        print(f"  {a}")
+    print()
+    print("If these don't overlap, attribution in 'report' is unreliable.")
+    print("Consider configuring git user.name per agent, or adding agent")
+    print("name to commit message trailers (e.g. 'Coop-Agent: claude').")
+
+
+def main():
+    if not COOP_DIR.exists():
+        print(f"No .agent-coop/ in {ROOT}. Run from project root.", file=sys.stderr)
+        sys.exit(1)
+
+    p = argparse.ArgumentParser(prog="coop-observe")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    ps = sub.add_parser("snapshot",
+                        help="capture current state; run periodically")
+    ps.set_defaults(func=cmd_snapshot)
+
+    pr = sub.add_parser("report",
+                        help="plain-text observation summary")
+    pr.set_defaults(func=cmd_report)
+
+    pa = sub.add_parser("attribution-check",
+                        help="compare git authors with coop agent names")
+    pa.set_defaults(func=cmd_attribution_check)
+
+    args = p.parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()

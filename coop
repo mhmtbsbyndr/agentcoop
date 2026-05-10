@@ -1,0 +1,214 @@
+#!/usr/bin/env python3
+"""
+agent-coop: minimal coordination layer for multiple coding agents
+working on the same project folder.
+
+Usage (every agent uses ONLY these commands, never edits files directly):
+
+  coop claim <path> --agent <name> --reason <text> [--ttl-min 30]
+  coop release <path> --agent <name>
+  coop claims                                    # list active claims
+  coop log <type> --agent <name> --payload '<json>'
+  coop events [--since <iso>] [--agent <name>]
+  coop status                                    # human-readable summary
+
+Truth model:
+  - events.jsonl is append-only, the single source of truth
+  - claims.json is derived but mutable for performance (rebuildable from events)
+  - everything in derived_state/ is regeneratable and may be deleted
+
+This is intentionally minimal. Resist adding features until usage proves need.
+"""
+import json
+import sys
+import os
+import argparse
+from datetime import datetime, timezone, timedelta
+from pathlib import Path
+
+ROOT = Path(os.environ.get("COOP_ROOT", ".")).resolve()
+COOP_DIR = ROOT / ".agent-coop"
+EVENTS = COOP_DIR / "events.jsonl"
+CLAIMS = COOP_DIR / "claims.json"
+
+
+def now_iso():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def append_event(event_type: str, agent: str, payload: dict):
+    event = {
+        "ts": now_iso(),
+        "agent": agent,
+        "type": event_type,
+        "payload": payload,
+    }
+    with EVENTS.open("a") as f:
+        f.write(json.dumps(event) + "\n")
+    return event
+
+
+def load_claims():
+    with CLAIMS.open() as f:
+        return json.load(f)
+
+
+def save_claims(data):
+    with CLAIMS.open("w") as f:
+        json.dump(data, f, indent=2)
+
+
+def prune_expired(claims_data):
+    now = datetime.now(timezone.utc)
+    active = []
+    for c in claims_data["claims"]:
+        expires = datetime.fromisoformat(c["expires"].replace("Z", "+00:00"))
+        if expires > now:
+            active.append(c)
+    claims_data["claims"] = active
+    return claims_data
+
+
+def cmd_claim(args):
+    data = prune_expired(load_claims())
+    # check conflicts
+    for c in data["claims"]:
+        if c["path"] == args.path and c["agent"] != args.agent:
+            print(
+                f"CONFLICT: {args.path} already claimed by {c['agent']} "
+                f"until {c['expires']} (reason: {c['reason']})",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+    expires = datetime.now(timezone.utc) + timedelta(minutes=args.ttl_min)
+    claim = {
+        "agent": args.agent,
+        "path": args.path,
+        "reason": args.reason,
+        "claimed_at": now_iso(),
+        "expires": expires.strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+    # remove same-agent same-path (refresh)
+    data["claims"] = [
+        c for c in data["claims"]
+        if not (c["agent"] == args.agent and c["path"] == args.path)
+    ]
+    data["claims"].append(claim)
+    save_claims(data)
+    append_event("CLAIM", args.agent, claim)
+    print(f"Claimed {args.path} until {claim['expires']}")
+
+
+def cmd_release(args):
+    data = prune_expired(load_claims())
+    before = len(data["claims"])
+    data["claims"] = [
+        c for c in data["claims"]
+        if not (c["agent"] == args.agent and c["path"] == args.path)
+    ]
+    save_claims(data)
+    if len(data["claims"]) < before:
+        append_event("RELEASE", args.agent, {"path": args.path})
+        print(f"Released {args.path}")
+    else:
+        print(f"No active claim by {args.agent} on {args.path}", file=sys.stderr)
+        sys.exit(1)
+
+
+def cmd_claims(args):
+    data = prune_expired(load_claims())
+    save_claims(data)
+    if not data["claims"]:
+        print("No active claims.")
+        return
+    for c in data["claims"]:
+        print(f"  {c['agent']:12s}  {c['path']:40s}  expires {c['expires']}  ({c['reason']})")
+
+
+def cmd_log(args):
+    try:
+        payload = json.loads(args.payload)
+    except json.JSONDecodeError as e:
+        print(f"Invalid JSON payload: {e}", file=sys.stderr)
+        sys.exit(1)
+    event = append_event(args.type, args.agent, payload)
+    print(f"Logged {event['type']} at {event['ts']}")
+
+
+def cmd_events(args):
+    with EVENTS.open() as f:
+        for line in f:
+            event = json.loads(line)
+            if args.agent and event["agent"] != args.agent:
+                continue
+            if args.since and event["ts"] < args.since:
+                continue
+            print(json.dumps(event))
+
+
+def cmd_status(args):
+    # quick human-readable view; this is derived state, regenerated on demand
+    data = prune_expired(load_claims())
+    save_claims(data)
+
+    event_count = sum(1 for _ in EVENTS.open())
+    types = {}
+    agents = {}
+    with EVENTS.open() as f:
+        for line in f:
+            e = json.loads(line)
+            types[e["type"]] = types.get(e["type"], 0) + 1
+            agents[e["agent"]] = agents.get(e["agent"], 0) + 1
+
+    print(f"=== agent-coop status @ {now_iso()} ===")
+    print(f"Events: {event_count}")
+    print(f"  by type:  {dict(sorted(types.items()))}")
+    print(f"  by agent: {dict(sorted(agents.items()))}")
+    print(f"Active claims: {len(data['claims'])}")
+    for c in data["claims"]:
+        print(f"  - {c['agent']} owns {c['path']} until {c['expires']}")
+
+
+def main():
+    if not COOP_DIR.exists():
+        print(f"No .agent-coop/ in {ROOT}. Run from project root.", file=sys.stderr)
+        sys.exit(1)
+
+    p = argparse.ArgumentParser(prog="coop")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    pc = sub.add_parser("claim")
+    pc.add_argument("path")
+    pc.add_argument("--agent", required=True)
+    pc.add_argument("--reason", required=True)
+    pc.add_argument("--ttl-min", type=int, default=30)
+    pc.set_defaults(func=cmd_claim)
+
+    pr = sub.add_parser("release")
+    pr.add_argument("path")
+    pr.add_argument("--agent", required=True)
+    pr.set_defaults(func=cmd_release)
+
+    pcl = sub.add_parser("claims")
+    pcl.set_defaults(func=cmd_claims)
+
+    pl = sub.add_parser("log")
+    pl.add_argument("type")
+    pl.add_argument("--agent", required=True)
+    pl.add_argument("--payload", required=True)
+    pl.set_defaults(func=cmd_log)
+
+    pe = sub.add_parser("events")
+    pe.add_argument("--since")
+    pe.add_argument("--agent")
+    pe.set_defaults(func=cmd_events)
+
+    ps = sub.add_parser("status")
+    ps.set_defaults(func=cmd_status)
+
+    args = p.parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()
